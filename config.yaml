@@ -1,0 +1,33 @@
+# 蝴蝶效应 —— 游戏参数（由 game-engine.py 读取）
+# 未安装 PyYAML 或文件缺失时使用代码内默认值
+
+game:
+  inactivity_timeout: 600        # 无操作超时（秒），超时后自动暂停本局
+  image_gen_interval: 3          # 每 N 次「玩家剧情决策」尝试生图（不含开局幕 [开始]；管理指令不计入）
+  max_story_nodes: 50            # 达到后自动触发「结束游戏」式收尾
+  context_window_nodes: 5        # 传给 LLM 的最近节点数（与历史摘要长度相关）
+
+llm:
+  provider: deepseek
+  model: deepseek-chat           # 也可用环境变量 LLM_MODEL 覆盖
+  temperature: 0.85
+  max_tokens: 2048
+
+# 以下为文档说明；实际文生图在代码中为火山方舟 Ark（OPENAI 兼容），见 .env 的 ARK_*
+image_gen:
+  provider: ark_volcengine
+  model: env:ARK_MODEL
+  size: "1792x1024"
+
+safety:
+  content_filter: false          # 未在引擎内单独实现过滤；依赖模型与平台策略
+  max_decisions_per_minute: 10   # 每群聊每分钟最多处理多少次 LLM 请求（含剧情决策、选项、导出梗概）
+
+# 剧本预设：群内发送「开始游戏 preset:键名」或「开始游戏 #键名」时使用 opening 作为开局种子
+presets:
+  mars:
+    title: "火星72小时"
+    opening: "我们是一队被困火星的宇航员，补给与氧气只剩约72小时，必须做出抉择。"
+  demo:
+    title: "赛博霓都"
+    opening: "你是底层义体技师，今夜接到一单无法拒绝的生意，委托人身份不明。"
