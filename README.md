@@ -11,6 +11,47 @@
 
 ---
 
+## 架构 / 数据流
+
+```mermaid
+flowchart LR
+  subgraph Feishu["飞书群聊"]
+    U["👤 用户 @机器人"]
+  end
+
+  U --> E["lark-cli\nevent +subscribe\n(WebSocket NDJSON)"]
+  E --> P["🐍 game-engine.py\n路由 & 状态管理"]
+
+  P -->|"剧情决策"| D["DeepSeek LLM\n(JSON: scene/narrative/mood/choices)"]
+  P -->|"每 N 次决策"| A["火山方舟 Ark\n(文生图)"]
+  P -->|"导出故事/梗概/结束"| Doc["lark-cli\ndocs +create"]
+
+  D --> P
+  A --> IM["lark-cli\nim +messages-send\n(图片)"]
+  Doc --> Link["📄 文档 URL 回群"]
+  P --> Reply["lark-cli\nim +messages-send\n(文本回复)"]
+```
+
+> 引擎以**单进程**常驻，通过 `lark-cli` 子进程完成所有飞书 I/O；DeepSeek 和 Ark 均为外部 HTTP 调用。
+
+---
+
+## 效果预览
+
+**群聊游戏进行中**
+
+![群聊游戏进行中](assets/screenshot-chat.png)
+
+**AI 生成概念图**
+
+![AI 生成概念图](assets/screenshot-artwork.png)
+
+**导出的飞书文档**
+
+![导出的飞书文档](assets/screenshot-doc.png)
+
+---
+
 ## 目录
 
 - [快速开始](#快速开始)
