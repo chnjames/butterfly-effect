@@ -24,6 +24,10 @@ load_dotenv(PROJECT_ROOT / ".env")
 IMAGE_SEND_CACHE = PROJECT_ROOT / ".butterfly-effect" / "image-cache"
 IMAGE_SEND_CACHE.mkdir(parents=True, exist_ok=True)
 
+# 持久图片目录：不随 24h 清理删除，供飞书文档导出时嵌入
+IMAGE_STORE = Path.home() / ".butterfly-effect" / "images"
+IMAGE_STORE.mkdir(parents=True, exist_ok=True)
+
 
 def _lark_cli() -> str:
     """Windows 上需使用 shutil.which，否则 subprocess 找不到 lark-cli.CMD。"""
@@ -226,7 +230,11 @@ def _resolve_story_seed(story: str) -> tuple[str, str, Optional[str]]:
 # ============================================================
 # 飞书文档存档
 # ============================================================
-def build_markdown(state) -> str:
+def build_markdown(state, for_doc: bool = False) -> str:
+    """生成故事 Markdown。
+    for_doc=True 时省略图片标签（飞书文档由 +media-insert 单独插入，避免空占位）。
+    for_doc=False（默认）时保留图片标签，用于本地快照。
+    """
     lines = []
     title = state.story_title or f"蝴蝶效应 - {datetime.datetime.now().strftime('%Y-%m-%d')}"
     lines.append(f"# {title}")
@@ -237,8 +245,12 @@ def build_markdown(state) -> str:
         lines.append("")
         lines.append(node["narrative"])
         lines.append("")
-        if node.get("image_url"):
-            lines.append(f"![概念图]({node['image_url']})")
+        if not for_doc:
+            local_img = node.get("local_image_path", "")
+            if local_img and Path(local_img).exists():
+                lines.append(f"![概念图]({Path(local_img).as_posix()})")
+            elif node.get("image_url"):
+                lines.append(f"![概念图]({node['image_url']})")
         lines.append("---")
     return "\n".join(lines)
 
@@ -263,11 +275,11 @@ def _parse_docs_create_url(stdout: str) -> str:
     return str(data.get("url") or "")
 
 
-def export_to_feishu_doc(title: str, markdown_content: str) -> str:
+def export_to_feishu_doc(title: str, markdown_content: str, state=None) -> str:
     """
     创建飞书云文档，返回 URL；失败返回空字符串。
-    使用 v1 API（--title 明确设置标题，避免 v2 无 title 参数导致文档显示 Untitled）。
-    正文里的 # H1 已包含完整内容，v1 --markdown 可正确渲染。
+    使用 v1 API（--title 明确设置标题）。
+    若传入 state，会在文档创建后用 docs +media-insert 逐节点插入本地概念图。
     """
     safe_title = (title or f"蝴蝶效应-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}").strip()
     body = (markdown_content or "").strip()
@@ -276,26 +288,60 @@ def export_to_feishu_doc(title: str, markdown_content: str) -> str:
     tmp = export_dir / f"story_{int(time.time() * 1000)}.md"
     tmp.write_text(body, encoding="utf-8")
     rel_content = "./" + tmp.relative_to(PROJECT_ROOT).as_posix()
-    cmd = [
-        "docs",
-        "+create",
-        "--as",
-        "bot",
-        "--title",
-        safe_title,
-        "--markdown",
-        f"@{rel_content}",
-    ]
+    cmd = ["docs", "+create", "--as", "bot", "--title", safe_title,
+           "--markdown", f"@{rel_content}"]
     result = run_lark_cli(cmd)
     out = (result.stdout or "").strip()
     err = (result.stderr or "").strip()
     if result.returncode == 0 and out:
         url = _parse_docs_create_url(out)
         if url:
+            _insert_doc_images(url, state)
             return url
     detail = err or out or "(无输出)"
     print(f"[ERROR] 创建飞书文档失败: {detail}", flush=True)
     return ""
+
+
+def _insert_doc_images(doc_url: str, state) -> None:
+    """文档创建后，逐节点把本地概念图用 docs +media-insert 追加进文档。"""
+    if not state or not state.nodes:
+        return
+    # 从 URL 中提取 doc_id（形如 .../docx/XXXXX）
+    import re as _re
+    m = _re.search(r"/docx/([A-Za-z0-9]+)", doc_url)
+    if not m:
+        print(f"[WARN] 无法从 URL 提取 doc_id，跳过图片插入: {doc_url}", flush=True)
+        return
+    doc_id = m.group(1)
+    tmp_dir = PROJECT_ROOT / ".butterfly-effect" / "export-temp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    inserted = 0
+    for node in state.nodes:
+        local_img = node.get("local_image_path", "")
+        if not local_img or not Path(local_img).exists():
+            continue
+        # lark-cli +media-insert 要求相对于 cwd(PROJECT_ROOT) 的路径
+        tmp_copy = tmp_dir / f"img_export_{node['index']}_{int(time.time()*1000)}.png"
+        try:
+            shutil.copy2(local_img, tmp_copy)
+            rel = "./" + tmp_copy.relative_to(PROJECT_ROOT).as_posix()
+            caption = f"第{node['index']}幕概念图"
+            res = run_lark_cli([
+                "docs", "+media-insert", "--as", "bot",
+                "--doc", doc_id,
+                "--file", rel,
+                "--caption", caption,
+            ])
+            if res.returncode == 0:
+                inserted += 1
+            else:
+                print(f"[WARN] 插入第{node['index']}幕图片失败", flush=True)
+        finally:
+            if tmp_copy.exists():
+                tmp_copy.unlink()
+    if inserted:
+        print(f"[INFO] 已向飞书文档追加 {inserted} 张概念图", flush=True)
 
 # ============================================================
 # 游戏状态管理
@@ -471,7 +517,7 @@ class GameState:
         with open(self.save_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
 
-    def add_node(self, player_id, decision, narrative, scene="", image_url=""):
+    def add_node(self, player_id, decision, narrative, scene="", image_url="", local_image_path=""):
         self.nodes.append({
             "index": len(self.nodes) + 1,
             "player_id": player_id,
@@ -479,6 +525,7 @@ class GameState:
             "narrative": narrative,
             "scene": scene,
             "image_url": image_url,
+            "local_image_path": local_image_path,
             "timestamp": datetime.datetime.now().isoformat(),
         })
         self.participants.add(player_id)
@@ -533,30 +580,27 @@ def send_text(chat_id, text) -> bool:
         print(f"[DEBUG] ← send_text rc={result.returncode}", flush=True)
     return result.returncode == 0
 
-def send_image(chat_id, image_url):
+def send_image(chat_id, image_url) -> Optional[str]:
+    """下载并发送图片。返回持久本地路径（供飞书文档嵌入），失败返回 None。"""
     try:
         resp = requests.get(image_url, timeout=120)
         resp.raise_for_status()
-        name = f"send_{int(time.time() * 1000)}.png"
-        local_path = IMAGE_SEND_CACHE / name
-        local_path.write_bytes(resp.content)
-        rel = "./" + local_path.relative_to(PROJECT_ROOT).as_posix()
+        ts = int(time.time() * 1000)
+        # 持久存储（供文档导出）
+        store_path = IMAGE_STORE / f"img_{ts}.png"
+        store_path.write_bytes(resp.content)
+        # 发图用临时副本（相对于 PROJECT_ROOT）
+        cache_path = IMAGE_SEND_CACHE / f"send_{ts}.png"
+        cache_path.write_bytes(resp.content)
+        rel = "./" + cache_path.relative_to(PROJECT_ROOT).as_posix()
         result = run_lark_cli(
-            [
-                "im",
-                "+messages-send",
-                "--as",
-                "bot",
-                "--chat-id",
-                chat_id,
-                "--image",
-                rel,
-            ],
+            ["im", "+messages-send", "--as", "bot",
+             "--chat-id", chat_id, "--image", rel],
         )
-        return result.returncode == 0
+        return str(store_path) if result.returncode == 0 else None
     except Exception as e:
         print(f"[WARN] 发送图片失败: {e}")
-        return False
+        return None
 
 # ============================================================
 # 游戏逻辑
@@ -957,8 +1001,10 @@ def handle_decision(chat_id, player_id, decision):
         else:
             url = generate_image(img_prompt)
             if url:
-                send_image(chat_id, url)
+                local_path = send_image(chat_id, url)
                 state.nodes[-1]["image_url"] = url
+                if local_path:
+                    state.nodes[-1]["local_image_path"] = local_path
                 state.save()
             else:
                 state.image_skips_this_run = int(getattr(state, "image_skips_this_run", 0)) + 1
@@ -980,7 +1026,7 @@ def handle_end(chat_id):
         state.active = False
         md = build_markdown(state)
         local_archive = save_finished_markdown(state, md)
-        url = export_to_feishu_doc(state.story_title, md)
+        url = export_to_feishu_doc(state.story_title, build_markdown(state, for_doc=True), state)
         state.runs_completed = int(getattr(state, "runs_completed", 0)) + 1
         state.last_ended_at = datetime.datetime.now().replace(microsecond=0).isoformat()
         sk = int(getattr(state, "image_skips_this_run", 0))
@@ -1099,7 +1145,7 @@ def handle_export_only(chat_id):
     md = build_markdown(state)
     title = state.story_title or f"蝴蝶效应-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}"
     local_archive = save_finished_markdown(state, md)
-    url = export_to_feishu_doc(title, md)
+    url = export_to_feishu_doc(title, build_markdown(state, for_doc=True), state)
     send_text(
         chat_id,
         f"已导出飞书文档（游戏未结束）：{url or '（失败，请检查 lark-cli）'}"
